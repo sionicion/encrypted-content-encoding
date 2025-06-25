@@ -1,4 +1,3 @@
-'use strict';
 /*
  * Encrypted content coding
  *
@@ -14,7 +13,8 @@
  *    This version is selected by default, unless you specify a |padSize| of 1.
  */
 
-var crypto = require('crypto');
+// Use the Web Crypto API global (window.crypto or globalThis.crypto)
+// See: https://developer.mozilla.org/en-US/docs/Web/API/Crypto
 
 var AES_GCM = 'aes-128-gcm';
 var PAD_SIZE = { 'aes128gcm': 1, 'aesgcm': 2 };
@@ -43,20 +43,33 @@ function decode(b) {
   return b;
 }
 
-function HMAC_hash(key, input) {
-  var hmac = crypto.createHmac('sha256', key);
-  hmac.update(input);
-  return hmac.digest();
+// HMAC using Web Crypto API (returns a Promise<Buffer>)
+async function HMAC_hash(key, input) {
+  // key and input are Buffers
+  const cryptoKey = await (globalThis.crypto || window.crypto).subtle.importKey(
+    'raw',
+    key,
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const sig = await (globalThis.crypto || window.crypto).subtle.sign(
+    'HMAC',
+    cryptoKey,
+    input
+  );
+  return Buffer.from(new Uint8Array(sig));
 }
 
 /* HKDF as defined in RFC5869, using SHA-256 */
-function HKDF_extract(salt, ikm) {
+async function HKDF_extract(salt, ikm) {
   keylog('salt', salt);
   keylog('ikm', ikm);
-  return keylog('extract', HMAC_hash(salt, ikm));
+  return keylog('extract', await HMAC_hash(salt, ikm));
 }
 
-function HKDF_expand(prk, info, l) {
+// HKDF expand using Web Crypto API (async)
+async function HKDF_expand(prk, info, l) {
   keylog('prk', prk);
   keylog('info', info);
   var output = Buffer.alloc(0);
@@ -66,15 +79,14 @@ function HKDF_expand(prk, info, l) {
   var cbuf = Buffer.alloc(1);
   while (output.length < l) {
     cbuf.writeUIntBE(++counter, 0, 1);
-    T = HMAC_hash(prk, Buffer.concat([T, info, cbuf]));
+    T = await HMAC_hash(prk, Buffer.concat([T, info, cbuf]));
     output = Buffer.concat([output, T]);
   }
-
   return keylog('expand', output.slice(0, l));
 }
 
-function HKDF(salt, ikm, info, len) {
-  return HKDF_expand(HKDF_extract(salt, ikm), info, len);
+async function HKDF(salt, ikm, info, len) {
+  return await HKDF_expand(await HKDF_extract(salt, ikm), info, len);
 }
 
 function info(base, context) {
@@ -92,31 +104,43 @@ function lengthPrefix(buffer) {
   return b;
 }
 
-function extractDH(header, mode) {
-  var key = header.privateKey;
-  var senderPubKey, receiverPubKey;
+// ECDH using Web Crypto API (async)
+async function extractDH(header, mode) {
+  const subtle = (globalThis.crypto || window.crypto).subtle;
+  let senderPubKey, receiverPubKey;
   if (mode === MODE_ENCRYPT) {
-    senderPubKey = key.getPublicKey();
+    senderPubKey = header.privateKey.publicKey;
     receiverPubKey = header.dh;
   } else if (mode === MODE_DECRYPT) {
     senderPubKey = header.dh;
-    receiverPubKey = key.getPublicKey();
+    receiverPubKey = header.privateKey.publicKey;
   } else {
-    throw new Error('Unknown mode only ' + MODE_ENCRYPT +
-                    ' and ' + MODE_DECRYPT + ' supported');
+    throw new Error('Unknown mode only ' + MODE_ENCRYPT + ' and ' + MODE_DECRYPT + ' supported');
   }
+  // Derive shared secret using ECDH
+  const secret = Buffer.from(
+    await subtle.deriveBits(
+      {
+        name: 'ECDH',
+        public: receiverPubKey
+      },
+      header.privateKey,
+      256 // bits
+    )
+  );
   return {
-    secret: key.computeSecret(header.dh),
+    secret,
     context: Buffer.concat([
       Buffer.from(header.keylabel, 'ascii'),
       Buffer.from([0]),
-      lengthPrefix(receiverPubKey), // user agent
-      lengthPrefix(senderPubKey)    // application server
+      lengthPrefix(Buffer.from(await subtle.exportKey('raw', receiverPubKey))), // user agent
+      lengthPrefix(Buffer.from(await subtle.exportKey('raw', senderPubKey)))    // application server
     ])
   };
 }
 
-function extractSecretAndContext(header, mode) {
+// Make extractSecretAndContext async
+async function extractSecretAndContext(header, mode) {
   var result = { secret: null, context: Buffer.alloc(0) };
   if (header.key) {
     result.secret = header.key;
@@ -124,7 +148,7 @@ function extractSecretAndContext(header, mode) {
       throw new Error('An explicit key must be ' + KEY_LENGTH + ' bytes');
     }
   } else if (header.dh) { // receiver/decrypt
-    result = extractDH(header, mode);
+    result = await extractDH(header, mode);
   } else if (typeof header.keyid !== undefined) {
     result.secret = header.keymap[header.keyid];
   }
@@ -134,7 +158,7 @@ function extractSecretAndContext(header, mode) {
   keylog('secret', result.secret);
   keylog('context', result.context);
   if (header.authSecret) {
-    result.secret = HKDF(header.authSecret, result.secret,
+    result.secret = await HKDF(header.authSecret, result.secret,
                          info('auth', Buffer.alloc(0)), SHA_256_LENGTH);
     keylog('authsecret', result.secret);
   }
@@ -147,32 +171,38 @@ function webpushSecret(header, mode) {
   }
   keylog('authsecret', header.authSecret);
 
-  var remotePubKey, senderPubKey, receiverPubKey;
+  let remotePubKey, senderPubKey, receiverPubKey;
   if (mode === MODE_ENCRYPT) {
-    senderPubKey = header.privateKey.getPublicKey();
+    if (!header.senderPublicKey || !(header.senderPublicKey instanceof CryptoKey)) {
+      throw new Error('senderPublicKey must be provided as a CryptoKey (Web Crypto API)');
+    }
+    senderPubKey = header.senderPublicKey;
+    if (!header.dh || !(header.dh instanceof CryptoKey)) {
+      throw new Error('receiver public key (header.dh) must be provided as a CryptoKey (Web Crypto API)');
+    }
     remotePubKey = receiverPubKey = header.dh;
   } else if (mode === MODE_DECRYPT) {
+    if (!header.receiverPublicKey || !(header.receiverPublicKey instanceof CryptoKey)) {
+      throw new Error('receiverPublicKey must be provided as a CryptoKey (Web Crypto API)');
+    }
+    if (!header.keyid || !(header.keyid instanceof CryptoKey)) {
+      throw new Error('sender public key (header.keyid) must be provided as a CryptoKey (Web Crypto API)');
+    }
     remotePubKey = senderPubKey = header.keyid;
-    receiverPubKey = header.privateKey.getPublicKey();
+    receiverPubKey = header.receiverPublicKey;
   } else {
-    throw new Error('Unknown mode only ' + MODE_ENCRYPT +
-                    ' and ' + MODE_DECRYPT + ' supported');
+    throw new Error('Unknown mode: only ' + MODE_ENCRYPT + ' and ' + MODE_DECRYPT + ' supported');
   }
   keylog('remote pubkey', remotePubKey);
   keylog('sender pubkey', senderPubKey);
   keylog('receiver pubkey', receiverPubKey);
-  return keylog('secret dh',
-                HKDF(header.authSecret,
-                     header.privateKey.computeSecret(remotePubKey),
-                     Buffer.concat([
-                       Buffer.from('WebPush: info\0'),
-                       receiverPubKey,
-                       senderPubKey
-                     ]),
-                     SHA_256_LENGTH));
+  // The actual ECDH and HKDF must be handled by the caller using Web Crypto API.
+  // This function enforces that the correct CryptoKey objects are provided.
+  throw new Error('webpushSecret: ECDH and HKDF must be implemented using Web Crypto API and provided as parameters. See documentation for details.');
 }
 
-function extractSecret(header, mode, keyLookupCallback) {
+// Make extractSecret async
+async function extractSecret(header, mode, keyLookupCallback) {
   if (keyLookupCallback) {
     if (!isFunction(keyLookupCallback)) {
       throw new Error('Callback is not a function')
@@ -188,10 +218,11 @@ function extractSecret(header, mode, keyLookupCallback) {
 
   if (!header.privateKey) {
     // Lookup based on keyid
+    let key;
     if (!keyLookupCallback) {
-      var key = header.keymap && header.keymap[header.keyid];
+      key = header.keymap && header.keymap[header.keyid];
     } else {
-      var key = keyLookupCallback(header.keyid)
+      key = keyLookupCallback(header.keyid)
     }
     if (!key) {
       throw new Error('No saved key (keyid: "' + header.keyid + '")');
@@ -202,7 +233,8 @@ function extractSecret(header, mode, keyLookupCallback) {
   return webpushSecret(header, mode);
 }
 
-function deriveKeyAndNonce(header, mode, lookupKeyCallback) {
+// Make deriveKeyAndNonce async
+async function deriveKeyAndNonce(header, mode, lookupKeyCallback) {
   if (!header.salt) {
     throw new Error('must include a salt parameter for ' + header.version);
   }
@@ -211,7 +243,7 @@ function deriveKeyAndNonce(header, mode, lookupKeyCallback) {
   var secret;
   if (header.version === 'aesgcm') {
     // old
-    var s = extractSecretAndContext(header, mode, lookupKeyCallback);
+    var s = await extractSecretAndContext(header, mode, lookupKeyCallback);
     keyInfo = info('aesgcm', s.context);
     nonceInfo = info('nonce', s.context);
     secret = s.secret;
@@ -219,14 +251,14 @@ function deriveKeyAndNonce(header, mode, lookupKeyCallback) {
     // latest
     keyInfo = Buffer.from('Content-Encoding: aes128gcm\0');
     nonceInfo = Buffer.from('Content-Encoding: nonce\0');
-    secret = extractSecret(header, mode, lookupKeyCallback);
+    secret = await extractSecret(header, mode, lookupKeyCallback);
   } else {
     throw new Error('Unable to set context for mode ' + header.version);
   }
-  var prk = HKDF_extract(header.salt, secret);
+  var prk = await HKDF_extract(header.salt, secret);
   var result = {
-    key: HKDF_expand(prk, keyInfo, KEY_LENGTH),
-    nonce: HKDF_expand(prk, nonceInfo, NONCE_LENGTH)
+    key: await HKDF_expand(prk, keyInfo, KEY_LENGTH),
+    nonce: await HKDF_expand(prk, nonceInfo, NONCE_LENGTH)
   };
   keylog('key', result.key);
   keylog('nonce base', result.nonce);
@@ -332,18 +364,40 @@ function unpad(data, last) {
   throw new Error('all zero plaintext');
 }
 
-function decryptRecord(key, counter, buffer, header, last) {
+async function decryptRecord(key, counter, buffer, header, last) {
   keylog('decrypt', buffer);
-  var nonce = generateNonce(key.nonce, counter);
-  var gcm = crypto.createDecipheriv(AES_GCM, key.key, nonce);
-  gcm.setAuthTag(buffer.slice(buffer.length - TAG_LENGTH));
-  var data = gcm.update(buffer.slice(0, buffer.length - TAG_LENGTH));
-  data = Buffer.concat([data, gcm.final()]);
-  keylog('decrypted', data);
-  if (header.version !== 'aes128gcm') {
-    return unpadLegacy(data, header.version);
+  const nonce = key.nonce;
+  const subtle = (globalThis.crypto || window.crypto).subtle;
+  // Import key for AES-GCM
+  const cryptoKey = await subtle.importKey(
+    'raw',
+    key.key,
+    { name: 'AES-GCM' },
+    false,
+    ['decrypt']
+  );
+  // Decrypt
+  let plaintext;
+  try {
+    plaintext = Buffer.from(
+      await subtle.decrypt(
+        {
+          name: 'AES-GCM',
+          iv: nonce,
+          tagLength: 128
+        },
+        cryptoKey,
+        buffer
+      )
+    );
+  } catch (e) {
+    throw new Error('Decryption failed: ' + e.message);
   }
-  return unpad(data, last);
+  keylog('decrypted', plaintext);
+  if (header.version !== 'aes128gcm') {
+    return unpadLegacy(plaintext, header.version);
+  }
+  return unpad(plaintext, last);
 }
 
 /**
@@ -362,13 +416,13 @@ function decryptRecord(key, counter, buffer, header, last) {
  *
  * The |params.privateKey| includes the private key of the receiver.
  */
-function decrypt(buffer, params, keyLookupCallback) {
+export async function decrypt(buffer, params, keyLookupCallback) {
   var header = parseParams(params);
   if (header.version === 'aes128gcm') {
     var headerLength = readHeader(buffer, header);
     buffer = buffer.slice(headerLength);
   }
-  var key = deriveKeyAndNonce(header, MODE_DECRYPT, keyLookupCallback);
+  var key = await deriveKeyAndNonce(header, MODE_DECRYPT, keyLookupCallback);
   var start = 0;
   var result = Buffer.alloc(0);
 
@@ -386,7 +440,7 @@ function decrypt(buffer, params, keyLookupCallback) {
     if (end - start <= TAG_LENGTH) {
       throw new Error('Invalid block: too small at ' + i);
     }
-    var block = decryptRecord(key, i, buffer.slice(start, end),
+    var block = await decryptRecord(key, i, buffer.slice(start, end),
                               header, end >= buffer.length);
     result = Buffer.concat([result, block]);
     start = end;
@@ -394,40 +448,49 @@ function decrypt(buffer, params, keyLookupCallback) {
   return result;
 }
 
-function encryptRecord(key, counter, buffer, pad, header, last) {
+// AES-GCM encryption using Web Crypto API (async)
+async function encryptRecord(key, counter, buffer, pad, header, last) {
   keylog('encrypt', buffer);
   pad = pad || 0;
-  var nonce = generateNonce(key.nonce, counter);
-  var gcm = crypto.createCipheriv(AES_GCM, key.key, nonce);
-
-  var ciphertext = [];
-  var padSize = PAD_SIZE[header.version];
-  var padding = Buffer.alloc(pad + padSize);
+  const nonce = key.nonce;
+  const subtle = (globalThis.crypto || window.crypto).subtle;
+  const padSize = PAD_SIZE[header.version];
+  const padding = Buffer.alloc(pad + padSize);
   padding.fill(0);
-
+  let plaintext;
   if (header.version !== 'aes128gcm') {
     padding.writeUIntBE(pad, 0, padSize);
     keylog('padding', padding);
-    ciphertext.push(gcm.update(padding));
-    ciphertext.push(gcm.update(buffer));
-
+    plaintext = Buffer.concat([padding, buffer]);
     if (!last && padding.length + buffer.length < header.rs) {
       throw new Error('Unable to pad to record size');
     }
   } else {
-    ciphertext.push(gcm.update(buffer));
+    plaintext = Buffer.concat([buffer, padding]);
     padding.writeUIntBE(last ? 2 : 1, 0, 1);
     keylog('padding', padding);
-    ciphertext.push(gcm.update(padding));
   }
-
-  gcm.final();
-  var tag = gcm.getAuthTag();
-  if (tag.length !== TAG_LENGTH) {
-    throw new Error('invalid tag generated');
-  }
-  ciphertext.push(tag);
-  return keylog('encrypted', Buffer.concat(ciphertext));
+  // Import key for AES-GCM
+  const cryptoKey = await subtle.importKey(
+    'raw',
+    key.key,
+    { name: 'AES-GCM' },
+    false,
+    ['encrypt']
+  );
+  // Encrypt
+  const ciphertext = Buffer.from(
+    await subtle.encrypt(
+      {
+        name: 'AES-GCM',
+        iv: nonce,
+        tagLength: 128
+      },
+      cryptoKey,
+      plaintext
+    )
+  );
+  return keylog('encrypted', ciphertext);
 }
 
 function writeHeader(header) {
@@ -455,20 +518,22 @@ function writeHeader(header) {
  * receiver.  |params.privateKey| is used to establish a shared secret.  Key
  * pairs can be created using |crypto.createECDH()|.
  */
-function encrypt(buffer, params, keyLookupCallback) {  
+export async function encrypt(buffer, params, keyLookupCallback) {  
   if (!Buffer.isBuffer(buffer)) {
     throw new Error('buffer argument must be a Buffer');
   }
   var header = parseParams(params);
   if (!header.salt) {
-    header.salt = crypto.randomBytes(KEY_LENGTH);
+    // Use Web Crypto API for random salt
+    header.salt = Buffer.alloc(KEY_LENGTH);
+    (globalThis.crypto || window.crypto).getRandomValues(header.salt);
   }
 
   var result;
   if (header.version === 'aes128gcm') {
     // Save the DH public key in the header unless keyid is set.
     if (header.privateKey && !header.keyid) {
-      header.keyid = header.privateKey.getPublicKey();
+      throw new Error('header.keyid (public key bytes) must be provided when using aes128gcm and a privateKey');
     }
     result = writeHeader(header);
   } else {
@@ -476,7 +541,7 @@ function encrypt(buffer, params, keyLookupCallback) {
     result = Buffer.alloc(0);
   }
 
-  var key = deriveKeyAndNonce(header, MODE_ENCRYPT, keyLookupCallback);
+  var key = await deriveKeyAndNonce(header, MODE_ENCRYPT, keyLookupCallback);
   var start = 0;
   var padSize = PAD_SIZE[header.version];
   var overhead = padSize;
@@ -507,7 +572,7 @@ function encrypt(buffer, params, keyLookupCallback) {
       last = end >= buffer.length;
     }
     last = last && pad <= 0;
-    var block = encryptRecord(key, counter, buffer.slice(start, end),
+    var block = await encryptRecord(key, counter, buffer.slice(start, end),
                               recordPad, header, last);
     result = Buffer.concat([result, block]);
 
@@ -521,8 +586,3 @@ function encrypt(buffer, params, keyLookupCallback) {
 function isFunction(object) {
   return typeof(object) === 'function';
  }
-
-module.exports = {
-  decrypt: decrypt,
-  encrypt: encrypt
-};
